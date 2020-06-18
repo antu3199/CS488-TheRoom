@@ -1,0 +1,15 @@
+#bin/bash
+
+push_function() {
+    cd ~/"cs488/$1"
+    git add --all
+    git commit -m "Auto Push"
+    git push
+    premake4 gmake
+}
+
+push_function $1
+
+
+
+

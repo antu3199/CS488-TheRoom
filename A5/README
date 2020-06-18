@@ -1,0 +1,27 @@
+============================================
+COMPILATION:
+
+Run the default premake4/make combination:
+    > premake4 gmake
+    > make
+Run the compiled A5 file with puppet parameter:
+    > ./A5 Assets/room.lua
+
+Nothing new necessary.
+
+============================================
+
+MANUAL:
+
+Enjoy the show!
+
+Note: Make sure you have sound on.
+
+See CS488 Project Objectives.pptx for screenshots of objectives.
+
+In case I cannot get sound to work in the demo, I have prerecorded a video of it at backup-video.avi (Low FPS)
+
+NOTE: Only certain computers in the graphics lab can get sound working. I tested on gl42.
+
+
+============================================

@@ -1,0 +1,29 @@
+#bin/bash
+
+maker_function() {
+    cd ~/"cs488/$1"
+    git pull
+    premake4 gmake
+    make
+    if [ $? -eq 0 ]; then
+        echo "COMPILATION SUCCESSED"
+    else
+        echo "COMPILATION FAILED"
+        return 1
+    fi
+
+    ./$1 $2
+
+    if [ $# -eq 3 ]; then
+        xdg-open $3
+    fi
+}
+
+if [ $# -eq 1 ] || [ $# -eq 2 ] || [ $# -eq 3 ]; then
+    maker_function $1 $2 $3
+else
+    echo "(cs488-maker) (AX), where X = Assignment number"
+fi
+
+
+

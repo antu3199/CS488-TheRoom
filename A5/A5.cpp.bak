@@ -1,0 +1,1670 @@
+// Winter 2019
+
+#include "A5.hpp"
+#include "scene_lua.hpp"
+using namespace std;
+
+#include "cs488-framework/GlErrorCheck.hpp"
+#include "cs488-framework/MathUtils.hpp"
+
+#include <imgui/imgui.h>
+
+#include <glm/gtc/type_ptr.hpp>
+#include <glm/gtx/io.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+#include <algorithm>
+#include <glm/ext.hpp>
+#include "ParticleSystem.hpp"
+
+#include "Image.hpp"
+
+using namespace glm;
+
+static bool show_gui = true;
+
+const size_t CIRCLE_PTS = 48;
+static const double SCROLL_SPEED = 0.005;
+
+//----------------------------------------------------------------------------------------
+// Constructor
+A5::A5(const std::string &luaSceneFile)
+    : m_luaSceneFile(luaSceneFile),
+      m_positionAttribLocation(0),
+      m_normalAttribLocation(0),
+      m_uvAttribLocation(0),
+      m_vao_meshData(0),
+      m_vbo_vertexPositions(0),
+      m_vbo_vertexNormals(0)
+{
+}
+
+//----------------------------------------------------------------------------------------
+// Destsructor
+A5::~A5()
+{
+  for (auto it = this->shaders.begin(); it != this->shaders.end(); it++) {
+    delete it->second;
+  }
+}
+
+//----------------------------------------------------------------------------------------
+/*
+ * Called once, at program start.
+ */
+void A5::init()
+{
+  // Set the background colour.
+  glClearColor(0.85, 0.85, 0.85, 1.0);
+
+  createShaderProgram();
+
+  glGenVertexArrays(1, &m_vao_meshData);
+ // enableVertexShaderInputSlots();
+
+  processLuaSceneFile(m_luaSceneFile);
+
+  // Load and decode all .obj files at once here.  You may add additional .obj files to
+  // this list in order to support rendering additional mesh types.  All vertex
+  // positions, and normals will be extracted and stored within the MeshConsolidator
+  // class.
+  unique_ptr<MeshConsolidator> meshConsolidator(new MeshConsolidator{
+      getAssetFilePath("uvcube.obj"),
+      getAssetFilePath("room/Floor.obj"),
+      getAssetFilePath("room/Cube.001.obj"),
+      getAssetFilePath("room/Template.006.obj"),
+      getAssetFilePath("room/Template.005.obj"),
+      getAssetFilePath("room/Template.003.obj"),
+  });
+
+  // Acquire the BatchInfoMap from the MeshConsolidator.
+  meshConsolidator->getBatchInfoMap(m_batchInfoMap);
+
+  // Take all vertex data within the MeshConsolidator and upload it to VBOs on the GPU.
+  uploadVertexDataToVbos(*meshConsolidator);
+
+  mapVboDataToVertexShaderInputLocations();
+
+  initPerspectiveMatrix();
+
+  initViewMatrix();
+
+  initLightSources();
+
+
+  // Exiting the current scope calls delete automatically on meshConsolidator freeing
+  // all vertex data resources.  This is fine since we already copied this data to
+  // VBOs on the GPU.  We have no use for storing vertex data on the CPU side beyond
+  // this point.
+
+  this->resetAll();
+
+  this->InitPass(*m_rootNode);
+  this->PostInitPass();
+}
+
+//----------------------------------------------------------------------------------------
+void A5::processLuaSceneFile(const std::string &filename)
+{
+  // This version of the code treats the Lua file as an Asset,
+  // so that you'd launch the program with just the filename
+  // of a puppet in the Assets/ directory.
+  // std::string assetFilePath = getAssetFilePath(filename.c_str());
+  // m_rootNode = std::shared_ptr<SceneNode>(import_lua(assetFilePath));
+
+  // This version of the code treats the main program argument
+  // as a straightforward pathname.
+  m_rootNode = std::shared_ptr<SceneNode>(import_lua(filename));
+  if (!m_rootNode)
+  {
+    std::cerr << "Could Not Open " << filename << std::endl;
+  }
+  else
+  {
+    this->mapJoints(*m_rootNode);
+  }
+}
+
+//----------------------------------------------------------------------------------------
+void A5::createShaderProgram()
+{
+  this->shaders["uvShader"] = new ShaderProgram();
+  ShaderProgram *uvShader = this->shaders["uvShader"];
+
+  uvShader->generateProgramObject();
+  uvShader->attachVertexShader(getAssetFilePath("uvVertexShader.vs").c_str());
+  uvShader->attachFragmentShader(getAssetFilePath("uvFragmentShader.fs").c_str());
+  uvShader->link();
+
+  this->shaders["particleSystem"] = new ShaderProgram();
+  ShaderProgram *particleShader = this->shaders["particleSystem"];
+
+  particleShader->generateProgramObject();
+  particleShader->attachVertexShader(getAssetFilePath("particleSystem.vs").c_str());
+  particleShader->attachFragmentShader(getAssetFilePath("particleSystem.fs").c_str());
+  particleShader->link();
+
+  
+  this->shaders["shadowDepthShader"] = new ShaderProgram();
+  ShaderProgram * shadowDepthShader = this->shaders["shadowDepthShader"];
+  shadowDepthShader->generateProgramObject();
+  shadowDepthShader->attachVertexShader(getAssetFilePath("shadowDepthShader.vs").c_str());
+  shadowDepthShader->attachFragmentShader(getAssetFilePath("shadowDepthShader.fs").c_str());
+  shadowDepthShader->attachGeometryShader(getAssetFilePath("shadowDepthShader.gs").c_str());
+  shadowDepthShader->link();
+
+  this->shaders["testShadowShader"] = new ShaderProgram();
+  ShaderProgram * testShadowShader = this->shaders["testShadowShader"];
+  testShadowShader->generateProgramObject();
+  testShadowShader->attachVertexShader(getAssetFilePath("testShadowShader.vs").c_str());
+  testShadowShader->attachFragmentShader(getAssetFilePath("testShadowShader.fs").c_str());
+  testShadowShader->link();
+
+
+  //this->initShadowDepthShader();
+}
+
+void A5::initShadowDepthShader()
+{
+
+  glEnable(GL_DEPTH_TEST);
+  glEnable(GL_CULL_FACE);
+  Image image;
+  this->testImage = image.loadImage(getAssetFilePath("wood.jpg"));
+
+  glGenFramebuffers(1, &shadowDepthMapFBO);
+  glGenTextures(1, &shadowDepthCubemap);
+  glBindTexture(GL_TEXTURE_CUBE_MAP, shadowDepthCubemap);
+
+  for (unsigned int i = 0; i < 6; i++)
+  {
+    glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + i, 0, GL_DEPTH_COMPONENT, SHADOWMAP_WIDTH, SHADOWMAP_HEIGHT, 0, GL_DEPTH_COMPONENT, GL_FLOAT, NULL);
+  }
+
+  glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+  glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+  glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+
+  glBindFramebuffer(GL_FRAMEBUFFER, shadowDepthMapFBO);
+  glFramebufferTexture(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, shadowDepthCubemap, 0);
+  glDrawBuffer(GL_NONE);
+  glReadBuffer(GL_NONE);
+  glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+  ShaderProgram * shader = this->shaders["testShadowShader"];
+
+  shader->enable();
+  GLuint texLoc = shader->getUniformLocation("diffuseTexture");
+  glUniform1i(texLoc, 0);
+
+  texLoc = shader->getUniformLocation("depthMap");
+  glUniform1i(texLoc, 1);
+  shader->disable();
+}
+
+//----------------------------------------------------------------------------------------
+void A5::enableVertexShaderInputSlots()
+{
+  //-- Enable input slots for m_vao_meshData:
+  for (auto it = this->shaders.begin(); it != this->shaders.end(); it++)
+  {
+
+    std::string key = it->first;
+    ShaderProgram *shader = it->second;
+
+    if (key == "uvShader")
+    {
+      {
+        glBindVertexArray(m_vao_meshData);
+
+        // Enable the vertex shader attribute location for "position" when rendering.
+        m_positionAttribLocation = shader->getAttribLocation("position");
+        glEnableVertexAttribArray(m_positionAttribLocation);
+
+        // Enable the vertex shader attribute location for "normal" when rendering.
+        m_normalAttribLocation = shader->getAttribLocation("normal");
+        glEnableVertexAttribArray(m_normalAttribLocation);
+
+        m_uvAttribLocation = shader->getAttribLocation("uv");
+        glEnableVertexAttribArray(m_uvAttribLocation);
+
+        m_tangentAttribLocation = shader->getAttribLocation("tangent");
+        glEnableVertexAttribArray(m_tangentAttribLocation);
+
+        m_bitangentAttribLocation = shader->getAttribLocation("bitangent");
+        glEnableVertexAttribArray(m_bitangentAttribLocation);
+
+        CHECK_GL_ERRORS;
+      }
+    }
+    else if (key == "shadowDepthShader")
+    {
+        //glBindVertexArray(m_vao_meshData);
+
+        // Enable the vertex shader attribute location for "position" when rendering.
+       // m_positionAttribLocation = shader->getAttribLocation("position");
+        //glEnableVertexAttribArray(m_positionAttribLocation);
+    }
+    else
+    {
+
+      //std::cout << "Unknown shader" << std::endl;
+    }
+
+    // Restore defaults
+    glBindVertexArray(0);
+  }
+}
+
+//----------------------------------------------------------------------------------------
+void A5::uploadVertexDataToVbos(
+    const MeshConsolidator &meshConsolidator)
+{
+  // Generate VBO to store all vertex position data
+  {
+    glGenBuffers(1, &m_vbo_vertexPositions);
+
+    glBindBuffer(GL_ARRAY_BUFFER, m_vbo_vertexPositions);
+
+    glBufferData(GL_ARRAY_BUFFER, meshConsolidator.getNumVertexPositionBytes(),
+                 meshConsolidator.getVertexPositionDataPtr(), GL_STATIC_DRAW);
+
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    CHECK_GL_ERRORS;
+  }
+
+  // Generate VBO to store all vertex normal data
+  {
+    glGenBuffers(1, &m_vbo_vertexNormals);
+
+    glBindBuffer(GL_ARRAY_BUFFER, m_vbo_vertexNormals);
+
+    glBufferData(GL_ARRAY_BUFFER, meshConsolidator.getNumVertexNormalBytes(),
+                 meshConsolidator.getVertexNormalDataPtr(), GL_STATIC_DRAW);
+
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    CHECK_GL_ERRORS;
+  }
+
+  {
+    glGenBuffers(1, &m_vbo_vertexUv);
+
+    glBindBuffer(GL_ARRAY_BUFFER, m_vbo_vertexUv);
+
+    glBufferData(GL_ARRAY_BUFFER, meshConsolidator.getNumVertexUVBytes(),
+                 meshConsolidator.getVertexUVDataPtr(), GL_STATIC_DRAW);
+
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+    CHECK_GL_ERRORS;
+  }
+
+  {
+
+    glGenBuffers(1, &m_vbo_vertexTangent);
+
+    glBindBuffer(GL_ARRAY_BUFFER, m_vbo_vertexTangent);
+
+    glBufferData(GL_ARRAY_BUFFER, meshConsolidator.getNumVertexTangentBytes(),
+                 meshConsolidator.getVertexTangentDataPtr(), GL_STATIC_DRAW);
+
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+    CHECK_GL_ERRORS;
+  }
+
+  {
+
+    glGenBuffers(1, &m_vbo_vertexBitangent);
+
+    glBindBuffer(GL_ARRAY_BUFFER, m_vbo_vertexBitangent);
+
+    glBufferData(GL_ARRAY_BUFFER, meshConsolidator.getNumVertexBitangentBytes(),
+                 meshConsolidator.getVertexBitangentDataPtr(), GL_STATIC_DRAW);
+
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+    CHECK_GL_ERRORS;
+  }
+}
+
+//----------------------------------------------------------------------------------------
+void A5::mapVboDataToVertexShaderInputLocations()
+{
+  // Bind VAO in order to record the data mapping.
+  glBindVertexArray(m_vao_meshData);
+
+  // Tell GL how to map data from the vertex buffer "m_vbo_vertexPositions" into the
+  // "position" vertex attribute location for any bound vertex shader program.
+  glBindBuffer(GL_ARRAY_BUFFER, m_vbo_vertexPositions);
+  glVertexAttribPointer(m_positionAttribLocation, 3, GL_FLOAT, GL_FALSE, 0, nullptr);
+
+  // Tell GL how to map data from the vertex buffer "m_vbo_vertexNormals" into the
+  // "normal" vertex attribute location for any bound vertex shader program.
+  glBindBuffer(GL_ARRAY_BUFFER, m_vbo_vertexNormals);
+  glVertexAttribPointer(m_normalAttribLocation, 3, GL_FLOAT, GL_FALSE, 0, nullptr);
+
+  glBindBuffer(GL_ARRAY_BUFFER, m_vbo_vertexUv);
+  glVertexAttribPointer(m_uvAttribLocation, 2, GL_FLOAT, GL_FALSE, 0, nullptr);
+
+  glBindBuffer(GL_ARRAY_BUFFER, m_vbo_vertexTangent);
+  glVertexAttribPointer(m_tangentAttribLocation, 3, GL_FLOAT, GL_FALSE, 0, nullptr);
+
+  glBindBuffer(GL_ARRAY_BUFFER, m_vbo_vertexBitangent);
+  glVertexAttribPointer(m_bitangentAttribLocation, 3, GL_FLOAT, GL_FALSE, 0, nullptr);
+
+  //-- Unbind target, and restore default values:
+  glBindBuffer(GL_ARRAY_BUFFER, 0);
+  glBindVertexArray(0);
+
+  CHECK_GL_ERRORS;
+}
+
+//----------------------------------------------------------------------------------------
+void A5::initPerspectiveMatrix()
+{
+  float aspect = ((float)m_windowWidth) / m_windowHeight;
+  //float fov = degreesToRadians(60.0f);
+  float fov = glm::radians(90.0f);
+  //near = 0.1f;
+  //far = 100.0f;
+  near = 1.0f;
+  far = 100.0f;
+  m_perpsective = glm::perspective(glm::radians(60.0f), aspect, 0.1f, 100.0f);
+
+  float shadowAspect = (float)SHADOWMAP_WIDTH / (float)SHADOWMAP_HEIGHT;
+  this->shadowProj = glm::perspective(glm::radians(90.0f), shadowAspect, near, far);
+}
+
+//----------------------------------------------------------------------------------------
+void A5::initViewMatrix()
+{
+  /*
+  m_view = glm::lookAt(vec3(0.0f, 5.0f, 5.0f), vec3(0.0f, 0.0f, 0.0f),
+                       vec3(0.0f, 1.0f, 0.0f));
+  */
+  position = glm::vec3(0, 0, 0);
+  rotation = glm::vec3(0, 0, 0);
+  m_view = glm::lookAt(position, vec3(0.0f, 0.0f, -1.0f),
+                       vec3(0.0f, 1.0f, 0.0f));
+}
+
+//----------------------------------------------------------------------------------------
+void A5::initLightSources()
+{
+  // World-space position
+  m_light.position = vec3(0.0f, 0.0f, 0.0f);
+  m_light.color = vec3(1.0f); // light
+  m_light.intensity = 5.0f;
+}
+
+//----------------------------------------------------------------------------------------
+void A5::uploadCommonSceneUniforms()
+{
+
+  for (auto it = this->shaders.begin(); it != this->shaders.end(); it++)
+  {
+
+    std::string key = it->first;
+    ShaderProgram *shader = it->second;
+
+    if (key == "uvShader")
+    {
+      shader->enable();
+      {
+        //-- Set Perpsective matrix uniform for the scene:
+        GLint location = shader->getUniformLocation("Perspective");
+        glUniformMatrix4fv(location, 1, GL_FALSE, value_ptr(m_perpsective));
+        CHECK_GL_ERRORS;
+
+        //-- Set LightSource uniform for the scene:
+        {
+          location = shader->getUniformLocation("light.color");
+          glUniform3fv(location, 1, value_ptr(m_light.color));
+          location = shader->getUniformLocation("light.intensity");
+          glUniform1f(location, m_light.intensity);
+
+          CHECK_GL_ERRORS;
+        }
+
+        //-- Set background light ambient intensity
+        {
+          location = shader->getUniformLocation("ambientIntensity");
+          vec3 ambientIntensity(0.05f);
+          glUniform3fv(location, 1, value_ptr(ambientIntensity));
+          CHECK_GL_ERRORS;
+        }
+
+        {
+          location = shader->getUniformLocation("light.position");
+          glUniform3fv(location, 1, value_ptr(this->m_light.position));
+
+          CHECK_GL_ERRORS;
+        }
+      }
+      shader->disable();
+    }
+    else
+    {
+      //std::cout << "Unknown shader" << std::endl;
+    }
+  }
+}
+
+//----------------------------------------------------------------------------------------
+/*
+ * Called once per frame, before guiLogic().
+ */
+void A5::appLogic()
+{
+  // Place per frame, application logic here ...
+  glfwGetCursorPos(this->m_window, &this->curMouseX, &this->curMouseY);
+
+  float movementSpeed = 0.1f;
+  glm::vec3 forward(rotationMatrix[0][2], rotationMatrix[1][2], rotationMatrix[2][2]);
+  glm::vec3 strafe(rotationMatrix[0][0], rotationMatrix[1][0], rotationMatrix[2][0]);
+
+  float dx = 0;
+  float dz = 0;
+
+  if (this->upPressed)
+  {
+    dz += 2;
+  }
+
+  if (this->downPressed)
+  {
+    dz += -2;
+  }
+
+  if (this->leftPressed)
+  {
+    dx += -2;
+  }
+
+  if (this->rightPressed)
+  {
+    dx += 2;
+  }
+
+  this->position += (-dz * forward + dx * strafe) * movementSpeed;
+  this->positionMatrix = glm::translate(glm::mat4(), -glm::vec3(this->position));
+
+  this->AnimLogic();
+  uploadCommonSceneUniforms();
+}
+
+//----------------------------------------------------------------------------------------
+/*
+ * Called once per frame, after appLogic(), but before the  method.
+ */
+void A5::guiLogic()
+{
+  if (!show_gui)
+  {
+    return;
+  }
+
+  static bool firstRun(true);
+  if (firstRun)
+  {
+    ImGui::SetNextWindowPos(ImVec2(50, 50));
+    firstRun = false;
+  }
+
+  static bool showDebugWindow(true);
+  ImGuiWindowFlags windowFlags(ImGuiWindowFlags_AlwaysAutoResize);
+  float opacity(0.5f);
+
+  ImGui::Begin("Properties", &showDebugWindow, ImVec2(100, 100), opacity,
+               windowFlags);
+
+  // Add more gui elements here here ...
+
+  // Create Button, and check if it was clicked:
+  if (ImGui::Button("Quit Application"))
+  {
+    glfwSetWindowShouldClose(m_window, GL_TRUE);
+  }
+
+  if (ImGui::BeginMenu("Application"))
+  {
+    if (ImGui::MenuItem("Reset Position (I)"))
+    {
+      this->resetPosition();
+    }
+
+    if (ImGui::MenuItem("Reset Orientation (O)"))
+    {
+      this->resetOrientation();
+    }
+
+    if (ImGui::MenuItem("Reset Joints (S)"))
+    {
+      this->resetJoints();
+    }
+
+    if (ImGui::MenuItem("Reset All (A)"))
+    {
+      this->resetAll();
+    }
+    ImGui::EndMenu();
+  }
+
+  if (ImGui::BeginMenu("Edit"))
+  {
+    if (ImGui::MenuItem("Undo (U)"))
+    {
+      this->undo();
+    }
+
+    if (ImGui::MenuItem("Redo (R)"))
+    {
+      this->redo();
+    }
+    ImGui::EndMenu();
+  }
+
+  if (ImGui::BeginMenu("Options"))
+  {
+    ImGui::Checkbox("Circle (C)", &toggleCircle);
+    ImGui::Checkbox("Z-Buffer (Z)", &toggleZBuffer);
+    ImGui::Checkbox("Backface culling (B)", &toggleBackfaceCulling);
+    ImGui::Checkbox("Frontface culling (F)", &toggleFrontfaceCulling);
+    ImGui::EndMenu();
+  }
+
+  if (ImGui::BeginMenu("Interaction Mode:"))
+  {
+    if (ImGui::RadioButton("Position/Orientation (P)", &this->curIntMode, INTERACTION_MODE::POSITION_ORIENTATION))
+    {
+      this->switchInteractionMode(INTERACTION_MODE::POSITION_ORIENTATION);
+    }
+    if (ImGui::RadioButton("Joints (J)", &this->curIntMode, INTERACTION_MODE::JOINTS))
+    {
+      this->switchInteractionMode(INTERACTION_MODE::JOINTS);
+    }
+    ImGui::EndMenu();
+  }
+
+  ImGui::Text("Framerate: %.1f FPS", ImGui::GetIO().Framerate);
+
+  ImGui::End();
+}
+
+// Application Menu
+void A5::resetPosition()
+{
+  this->initViewMatrix();
+  this->viewTransformations = glm::mat4();
+}
+
+void A5::resetOrientation()
+{
+}
+void A5::resetJoints()
+{
+  for (auto joint : this->joints)
+  {
+    joint->reset();
+  }
+
+  this->undoStack = std::stack<JointMoveCommand>();
+  this->redoStack = std::stack<JointMoveCommand>();
+  this->curJointMoveCommand.reset();
+}
+void A5::resetAll()
+{
+  this->resetPosition();
+  this->resetOrientation();
+  this->resetJoints();
+}
+
+void A5::switchInteractionMode(INTERACTION_MODE mode)
+{
+  this->interactionMode = mode;
+  this->curIntMode = (int)this->interactionMode;
+}
+
+void A5::undo()
+{
+  if (this->undoStack.empty())
+    return;
+
+  JointMoveCommand command = this->undoStack.top();
+  this->undoStack.pop();
+  this->redoStack.emplace(command);
+  command.undo();
+}
+
+void A5::redo()
+{
+  if (this->redoStack.empty())
+    return;
+  JointMoveCommand command = this->redoStack.top();
+  this->redoStack.pop();
+  this->undoStack.emplace(command);
+  command.redo();
+}
+
+//----------------------------------------------------------------------------------------
+// Update mesh specific shader uniforms:
+void A5::updateShaderUniforms(
+    const std::string &shaderName,
+    const GeometryNode &node,
+    const glm::mat4 &model)
+{
+  ShaderProgram *shader = this->shaders[shaderName];
+
+  shader->enable();
+  {
+
+    if (shaderName == "uvShader")
+    {
+
+      //-- Set ModelView matrix:
+      GLint location = shader->getUniformLocation("Model");
+
+      glUniformMatrix4fv(location, 1, GL_FALSE, value_ptr(model));
+      CHECK_GL_ERRORS;
+
+      location = shader->getUniformLocation("View");
+
+      glUniformMatrix4fv(location, 1, GL_FALSE, value_ptr(this->viewTransformations));
+      CHECK_GL_ERRORS;
+
+      //-- Set Material values:
+      if (this->isPicking)
+      {
+        unsigned int idx = node.m_nodeId;
+        float r = float(idx & 0xff) / 255.0f;
+        float g = float((idx >> 8) & 0xff) / 255.0f;
+        float b = float((idx >> 16) & 0xff) / 255.0f;
+
+        glUniform3f(shader->getUniformLocation("material.kd"), r, g, b);
+        CHECK_GL_ERRORS;
+      }
+      else
+      {
+        glm::mat4 modelView = this->viewTransformations * model;
+
+        //-- Set NormMatrix:
+        location = shader->getUniformLocation("NormalMatrix");
+        mat3 normalMatrix = glm::transpose(glm::inverse(mat3(modelView)));
+        glUniformMatrix3fv(location, 1, GL_FALSE, value_ptr(normalMatrix));
+        CHECK_GL_ERRORS;
+
+        location = shader->getUniformLocation("material.kd");
+        vec3 kd = node.material.kd;
+        if (this->pickedJointChildren.find(node.m_nodeId) != this->pickedJointChildren.end())
+        {
+          kd = glm::vec3(1.0, 0.6181f, 0.1650f);
+        }
+
+        glUniform3fv(location, 1, value_ptr(kd));
+        CHECK_GL_ERRORS;
+        location = shader->getUniformLocation("material.ks");
+        vec3 ks = node.material.ks;
+        glUniform3fv(location, 1, value_ptr(ks));
+        CHECK_GL_ERRORS;
+        location = shader->getUniformLocation("material.shininess");
+        glUniform1f(location, node.material.shininess);
+        CHECK_GL_ERRORS;
+
+        glBindTexture(GL_TEXTURE_2D, 0);
+
+        GLint texLoc = shader->getUniformLocation("texture0");
+        glUniform1i(texLoc, 0);
+
+        texLoc = shader->getUniformLocation("normalMap");
+        glUniform1i(texLoc, 1);
+
+        texLoc = shader->getUniformLocation("depthMap");
+        glUniform1i(texLoc, 2);
+
+        bool hasTextureMap = node.material.hasTexture;
+        location = shader->getUniformLocation("hasTextureMap");
+        glUniform1i(location, hasTextureMap);
+
+        if (hasTextureMap)
+        {
+          glActiveTexture(GL_TEXTURE0);
+          glBindTexture(GL_TEXTURE_2D, node.material.texture);
+        }
+
+        bool hasNormalMap = node.material.hasNormalMap;
+        location = shader->getUniformLocation("hasNormalMap");
+        glUniform1i(location, hasNormalMap);
+
+        if (hasNormalMap)
+        {
+          glActiveTexture(GL_TEXTURE0 + 1); // Make sure to set uniform location
+          glBindTexture(GL_TEXTURE_2D, node.material.normalMap);
+        }
+
+        // Shadows
+        glActiveTexture(GL_TEXTURE0 + 2);
+        glBindTexture(GL_TEXTURE_CUBE_MAP, shadowDepthCubemap);
+
+        CHECK_GL_ERRORS;
+      }
+    }
+    else if (shaderName == "shadowDepthShader")
+    {
+      /*
+      GLint location = shader->getUniformLocation("model");
+
+      glUniformMatrix4fv(location, 1, GL_FALSE, value_ptr(model));
+      CHECK_GL_ERRORS;
+      */
+    }
+    else
+    {
+      //std::cout << "Unknown shader" << std::endl;
+    }
+  }
+
+  shader->disable();
+}
+
+//----------------------------------------------------------------------------------------
+/*
+ * Called once per frame, after guiLogic().
+ */
+void A5::draw()
+{ 
+
+
+  glEnable(GL_CULL_FACE);
+  this->viewTransformations = rotationMatrix * positionMatrix;
+  //this->m_light.position = vec3(0.0f);
+  //this->m_light.position.z = sin(this->absTime * 0.5) * 0.01f;
+
+
+
+  //this->renderShadowSceneGraph();
+
+ // this->normalTestDraw();
+
+
+
+  this->renderNormalSceneGraph();
+}
+
+void A5::renderShadowSceneGraph()
+{
+
+  glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
+  glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+
+
+
+  std::vector<glm::mat4> shadowTransforms;
+  shadowTransforms.push_back(shadowProj * glm::lookAt(m_light.position, m_light.position + glm::vec3(1.0f, 0.0f, 0.0f), glm::vec3(0.0f, -1.0f, 0.0f)));
+  shadowTransforms.push_back(shadowProj * glm::lookAt(m_light.position, m_light.position + glm::vec3(-1.0f, 0.0f, 0.0f), glm::vec3(0.0f, -1.0f, 0.0f)));
+  shadowTransforms.push_back(shadowProj * glm::lookAt(m_light.position, m_light.position + glm::vec3(0.0f, 1.0f, 0.0f), glm::vec3(0.0f, 0.0f, 1.0f)));
+  shadowTransforms.push_back(shadowProj * glm::lookAt(m_light.position, m_light.position + glm::vec3(0.0f, -1.0f, 0.0f), glm::vec3(0.0f, 0.0f, -1.0f)));
+  shadowTransforms.push_back(shadowProj * glm::lookAt(m_light.position, m_light.position + glm::vec3(0.0f, 0.0f, 1.0f), glm::vec3(0.0f, -1.0f, 0.0f)));
+  shadowTransforms.push_back(shadowProj * glm::lookAt(m_light.position, m_light.position + glm::vec3(0.0f, 0.0f, -1.0f), glm::vec3(0.0f, -1.0f, 0.0f)));
+
+  glViewport(0, 0, SHADOWMAP_WIDTH, SHADOWMAP_HEIGHT);
+  glBindFramebuffer(GL_FRAMEBUFFER, shadowDepthMapFBO);
+  glClear(GL_DEPTH_BUFFER_BIT);
+
+  ShaderProgram *shadowDepthShader = this->shaders["shadowDepthShader"];
+  shadowDepthShader->enable();
+  for (unsigned int i = 0; i < 6; ++i)
+  {
+    std::string shadowMatrixString = "shadowMatrices[" + std::to_string(i) + "]";
+    GLuint matrixLoc = shadowDepthShader->getUniformLocation(shadowMatrixString.c_str());
+    glUniformMatrix4fv(matrixLoc, 1, GL_FALSE, value_ptr(shadowTransforms[i]));
+  }
+
+  GLuint location = shadowDepthShader->getUniformLocation("far_plane");
+  glUniform1f(location, far);
+
+  location = shadowDepthShader->getUniformLocation("lightPos");
+  glUniform3fv(location, 1, value_ptr(this->m_light.position));
+
+
+
+
+  //this->renderScene(shadowDepthShader, "shadowDepthShader");
+  renderSceneGraph(*m_rootNode, glm::mat4(), "shadowDepthShader");
+  
+  //this->shadowTestDraw();
+  shadowDepthShader->disable();
+
+  glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+
+
+}
+
+void A5::normalTestDraw() {
+
+// 2
+
+  glViewport(0, 0, this->m_windowWidth, this->m_windowHeight);
+  glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+  ShaderProgram * shader = this->shaders["testShadowShader"];
+  shader->enable();
+  float aspect = ((float)m_windowWidth) / m_windowHeight;
+
+  glm::mat4 projection = glm::perspective(glm::radians(60.0f), aspect, 0.1f, 100.0f);
+  glm::mat4 view = this->viewTransformations;
+
+
+  GLuint location = shader->getUniformLocation("projection");
+  glUniformMatrix4fv(location, 1, GL_FALSE, value_ptr(projection));
+
+  location = shader->getUniformLocation("view");
+  glUniformMatrix4fv(location, 1, GL_FALSE, value_ptr(view));
+
+  location = shader->getUniformLocation("lightPos");
+  glUniform3fv(location, 1, value_ptr(this->m_light.position));
+  
+  location = shader->getUniformLocation("shadows");
+  glUniform1f(location, true);
+
+  location = shader->getUniformLocation("far_plane");
+  glUniform1f(location, far);
+
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, this->testImage);
+  glActiveTexture(GL_TEXTURE1);
+  glBindTexture(GL_TEXTURE_CUBE_MAP, this->shadowDepthCubemap);
+
+  this->renderScene(shader, "testShadowShader");
+
+  shader->disable();
+
+
+
+}
+
+void A5::renderScene(ShaderProgram * shader, std::string name) {
+    // room cube
+    
+    glm::mat4 model = glm::mat4(1.0f);
+    model = glm::scale(model, glm::vec3(5.0f));
+    GLuint location = shader->getUniformLocation("model");
+    glUniformMatrix4fv(location, 1, GL_FALSE, value_ptr(model));
+
+    glDisable(GL_CULL_FACE); // note that we disable culling here since we render 'inside' the cube instead of the usual 'outside' which throws off the normal culling methods.
+    
+    if (name == "testShadowShader") {
+      location = shader->getUniformLocation("reverse_normals");
+      glUniform1f(location, 1);
+    }
+
+    renderCube();
+
+
+    if (name == "testShadowShader") {
+      location = shader->getUniformLocation("reverse_normals");
+      glUniform1f(location, 0);
+    }
+
+    glEnable(GL_CULL_FACE);
+
+    // cubes
+    model = glm::mat4(1.0f);
+    model = glm::translate(model, glm::vec3(4.0f, -3.5f, 0.0));
+    model = glm::scale(model, glm::vec3(0.5f));
+    location = shader->getUniformLocation("model");
+    glUniformMatrix4fv(location, 1, GL_FALSE, value_ptr(model));
+
+    renderCube();
+
+/*
+    model = glm::mat4();
+    model = glm::translate(model, m_light.position);
+    model = glm::scale(model, glm::vec3(0.75f));
+    location = shader->getUniformLocation("model");
+    glUniformMatrix4fv(location, 1, GL_FALSE, value_ptr(model));
+
+    renderCube();
+    */
+    model = glm::mat4(1.0f);
+    model = glm::translate(model, glm::vec3(-3.0f, -1.0f, 0.0));
+    model = glm::scale(model, glm::vec3(0.5f));
+    location = shader->getUniformLocation("model");
+    glUniformMatrix4fv(location, 1, GL_FALSE, value_ptr(model));
+
+    renderCube();
+    model = glm::mat4(1.0f);
+    model = glm::translate(model, glm::vec3(-1.5f, 1.0f, 1.5));
+    model = glm::scale(model, glm::vec3(0.5f));
+    location = shader->getUniformLocation("model");
+    glUniformMatrix4fv(location, 1, GL_FALSE, value_ptr(model));
+
+    renderCube();
+    model = glm::mat4(1.0f);
+    model = glm::translate(model, glm::vec3(-1.5f, 2.0f, -3.0));
+    model = glm::rotate(model, glm::radians(60.0f), glm::normalize(glm::vec3(1.0, 0.0, 1.0)));
+    model = glm::scale(model, glm::vec3(0.75f));
+    location = shader->getUniformLocation("model");
+    glUniformMatrix4fv(location, 1, GL_FALSE, value_ptr(model));
+    renderCube();
+}
+
+void A5::renderCube() {
+    // initialize (if necessary)
+    if (cubeVAO == 0)
+    {
+        float vertices[] = {
+            // back face
+            -1.0f, -1.0f, -1.0f,  0.0f,  0.0f, -1.0f, 0.0f, 0.0f, // bottom-left
+             1.0f,  1.0f, -1.0f,  0.0f,  0.0f, -1.0f, 1.0f, 1.0f, // top-right
+             1.0f, -1.0f, -1.0f,  0.0f,  0.0f, -1.0f, 1.0f, 0.0f, // bottom-right         
+             1.0f,  1.0f, -1.0f,  0.0f,  0.0f, -1.0f, 1.0f, 1.0f, // top-right
+            -1.0f, -1.0f, -1.0f,  0.0f,  0.0f, -1.0f, 0.0f, 0.0f, // bottom-left
+            -1.0f,  1.0f, -1.0f,  0.0f,  0.0f, -1.0f, 0.0f, 1.0f, // top-left
+            // front face
+            -1.0f, -1.0f,  1.0f,  0.0f,  0.0f,  1.0f, 0.0f, 0.0f, // bottom-left
+             1.0f, -1.0f,  1.0f,  0.0f,  0.0f,  1.0f, 1.0f, 0.0f, // bottom-right
+             1.0f,  1.0f,  1.0f,  0.0f,  0.0f,  1.0f, 1.0f, 1.0f, // top-right
+             1.0f,  1.0f,  1.0f,  0.0f,  0.0f,  1.0f, 1.0f, 1.0f, // top-right
+            -1.0f,  1.0f,  1.0f,  0.0f,  0.0f,  1.0f, 0.0f, 1.0f, // top-left
+            -1.0f, -1.0f,  1.0f,  0.0f,  0.0f,  1.0f, 0.0f, 0.0f, // bottom-left
+            // left face
+            -1.0f,  1.0f,  1.0f, -1.0f,  0.0f,  0.0f, 1.0f, 0.0f, // top-right
+            -1.0f,  1.0f, -1.0f, -1.0f,  0.0f,  0.0f, 1.0f, 1.0f, // top-left
+            -1.0f, -1.0f, -1.0f, -1.0f,  0.0f,  0.0f, 0.0f, 1.0f, // bottom-left
+            -1.0f, -1.0f, -1.0f, -1.0f,  0.0f,  0.0f, 0.0f, 1.0f, // bottom-left
+            -1.0f, -1.0f,  1.0f, -1.0f,  0.0f,  0.0f, 0.0f, 0.0f, // bottom-right
+            -1.0f,  1.0f,  1.0f, -1.0f,  0.0f,  0.0f, 1.0f, 0.0f, // top-right
+            // right face
+             1.0f,  1.0f,  1.0f,  1.0f,  0.0f,  0.0f, 1.0f, 0.0f, // top-left
+             1.0f, -1.0f, -1.0f,  1.0f,  0.0f,  0.0f, 0.0f, 1.0f, // bottom-right
+             1.0f,  1.0f, -1.0f,  1.0f,  0.0f,  0.0f, 1.0f, 1.0f, // top-right         
+             1.0f, -1.0f, -1.0f,  1.0f,  0.0f,  0.0f, 0.0f, 1.0f, // bottom-right
+             1.0f,  1.0f,  1.0f,  1.0f,  0.0f,  0.0f, 1.0f, 0.0f, // top-left
+             1.0f, -1.0f,  1.0f,  1.0f,  0.0f,  0.0f, 0.0f, 0.0f, // bottom-left     
+            // bottom face
+            -1.0f, -1.0f, -1.0f,  0.0f, -1.0f,  0.0f, 0.0f, 1.0f, // top-right
+             1.0f, -1.0f, -1.0f,  0.0f, -1.0f,  0.0f, 1.0f, 1.0f, // top-left
+             1.0f, -1.0f,  1.0f,  0.0f, -1.0f,  0.0f, 1.0f, 0.0f, // bottom-left
+             1.0f, -1.0f,  1.0f,  0.0f, -1.0f,  0.0f, 1.0f, 0.0f, // bottom-left
+            -1.0f, -1.0f,  1.0f,  0.0f, -1.0f,  0.0f, 0.0f, 0.0f, // bottom-right
+            -1.0f, -1.0f, -1.0f,  0.0f, -1.0f,  0.0f, 0.0f, 1.0f, // top-right
+            // top face
+            -1.0f,  1.0f, -1.0f,  0.0f,  1.0f,  0.0f, 0.0f, 1.0f, // top-left
+             1.0f,  1.0f , 1.0f,  0.0f,  1.0f,  0.0f, 1.0f, 0.0f, // bottom-right
+             1.0f,  1.0f, -1.0f,  0.0f,  1.0f,  0.0f, 1.0f, 1.0f, // top-right     
+             1.0f,  1.0f,  1.0f,  0.0f,  1.0f,  0.0f, 1.0f, 0.0f, // bottom-right
+            -1.0f,  1.0f, -1.0f,  0.0f,  1.0f,  0.0f, 0.0f, 1.0f, // top-left
+            -1.0f,  1.0f,  1.0f,  0.0f,  1.0f,  0.0f, 0.0f, 0.0f  // bottom-left        
+        };
+        glGenVertexArrays(1, &cubeVAO);
+        glGenBuffers(1, &cubeVBO);
+        // fill buffer
+        glBindBuffer(GL_ARRAY_BUFFER, cubeVBO);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
+        // link vertex attributes
+        glBindVertexArray(cubeVAO);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)0);
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(3 * sizeof(float)));
+        glEnableVertexAttribArray(2);
+        glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(6 * sizeof(float)));
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        glBindVertexArray(0);
+    }
+    // render Cube
+    glBindVertexArray(cubeVAO);
+    glDrawArrays(GL_TRIANGLES, 0, 36);
+    glBindVertexArray(0);
+}
+
+void A5::renderNormalSceneGraph()
+{
+
+  glViewport(0, 0, this->m_windowWidth, this->m_windowHeight);
+  glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+  glEnable(GL_BLEND);
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+  glEnable(GL_DEPTH_TEST);
+  glDepthFunc(GL_LESS);
+
+  renderSceneGraph(*m_rootNode, glm::mat4());
+
+  //glDisable(GL_CULL_FACE);
+}
+
+//----------------------------------------------------------------------------------------
+void A5::renderSceneGraph(SceneNode &root, glm::mat4 model, std::string shaderOverride)
+{
+
+  // Bind the VAO once here, and reuse for all GeometryNode rendering below.
+  glBindVertexArray(m_vao_meshData);
+
+  // This is emphatically *not* how you should be drawing the scene graph in
+  // your final implementation.  This is a non-hierarchical demonstration
+  // in which we assume that there is a list of GeometryNodes living directly
+  // underneath the root node, and that we can draw them in a loop.  It's
+  // just enough to demonstrate how to get geometry and materials out of
+  // a GeometryNode and onto the screen.
+
+  // You'll want to turn this into recursive code that walks over the tree.
+  // You can do that by putting a method in SceneNode, overridden in its
+  // subclasses, that renders the subtree rooted at every node.  Or you
+  // could put a set of mutually recursive functions in this class, which
+  // walk down the tree from nodes of different types.
+
+
+  mat4 nodeTrans = root.isAnimating == true ? root.getAnimMatrix() : root.trans;
+
+  model = model * nodeTrans;
+
+  switch (root.m_nodeType)
+  {
+  case NodeType::GeometryNode:
+  {
+    const GeometryNode *geometryNode = static_cast<const GeometryNode *>(&root);
+    std::string shaderName = shaderOverride == "" ? geometryNode->material.shaderName : shaderOverride;
+
+    this->updateShaderUniforms(shaderName, *geometryNode, model);
+
+    // Get the BatchInfo corresponding to the GeometryNode's unique MeshId.
+    BatchInfo batchInfo = m_batchInfoMap[geometryNode->meshId];
+    ShaderProgram *shader = this->shaders[shaderName];
+
+    //-- Now render the mesh:
+    shader->enable();
+
+    //glDrawArrays(GL_TRIANGLES, 0, batchInfo.numIndices);
+    cout << "Draw: " << shaderName << endl;
+    glDrawArrays(GL_TRIANGLES, batchInfo.startIndex, batchInfo.numIndices);
+    shader->disable();
+    break;
+  }
+  case NodeType::JointNode:
+    const JointNode *jointNode = static_cast<const JointNode *>(&root);
+    model = model * glm::rotate(glm::mat4(), (float)glm::radians(jointNode->getCurYRot()), glm::vec3(0, 1, 0));
+    model = model * glm::rotate(glm::mat4(), (float)glm::radians(jointNode->getCurXRot()), glm::vec3(1, 0, 0));
+    break;
+  }
+
+  if (root.particleSystem != nullptr && shaderOverride == "")
+  {
+    glm::vec3 nodePos = glm::vec3(nodeTrans[3][0], nodeTrans[3][1], nodeTrans[3][2]);
+    root.particleSystem->isSpawning = this->testFlag;
+    root.particleSystem->Update(this->deltaTime, nodePos, this->position);
+    root.particleSystem->Draw();
+  }
+
+  for (SceneNode *node : root.children)
+  {
+    this->renderSceneGraph(*node, model, shaderOverride);
+  }
+
+  glBindVertexArray(0);
+  CHECK_GL_ERRORS;
+}
+
+//----------------------------------------------------------------------------------------
+/*
+ * Called once, after program is signaled to terminate.
+ */
+void A5::cleanup()
+{
+}
+
+//----------------------------------------------------------------------------------------
+/*
+ * Event handler.  Handles cursor entering the window area events.
+ */
+bool A5::cursorEnterWindowEvent(
+    int entered)
+{
+  bool eventHandled(false);
+
+  // Fill in with event handling code...
+
+  return eventHandled;
+}
+
+//----------------------------------------------------------------------------------------
+/*
+ * Event handler.  Handles mouse cursor movement events.
+ */
+bool A5::mouseMoveEvent(
+    double xPos,
+    double yPos)
+{
+  bool eventHandled(false);
+
+  // Fill in with event handling code...
+
+  if (!ImGui::IsMouseHoveringAnyWindow())
+  {
+    double deltaX = xPos - this->lastMouseX;
+    double deltaY = yPos - this->lastMouseY;
+
+    float movementX = static_cast<float>(deltaX * SCROLL_SPEED);
+    float movementY = static_cast<float>(deltaY * SCROLL_SPEED);
+
+    if (this->interactionMode == INTERACTION_MODE::POSITION_ORIENTATION)
+    {
+      if (this->leftClickActive)
+      {
+      }
+      if (this->middleClickActive)
+      {
+      }
+      if (this->rightClickActive)
+      {
+        //  if (rotation.y + movementX >= -1.0f && rotation.y + movementX <= 1.0f ) {
+        //camYAngle += movementX;
+        rotation.y += movementX;
+        //  }
+
+        if (rotation.x + movementY >= -1.0f && rotation.x + movementY <= 0.5f)
+        {
+          rotation.x += movementY;
+        }
+        rotationMatrix = glm::rotate(glm::mat4(), rotation.x, glm::vec3(1, 0, 0)) * glm::rotate(glm::mat4(), rotation.y, glm::vec3(0, 1, 0));
+      }
+    }
+
+    this->lastMouseX = xPos;
+    this->lastMouseY = yPos;
+  }
+
+  return eventHandled;
+}
+
+//----------------------------------------------------------------------------------------
+/*
+ * Event handler.  Handles mouse button events.
+ */
+bool A5::mouseButtonInputEvent(
+    int button,
+    int actions,
+    int mods)
+{
+  bool eventHandled(false);
+
+  if (!ImGui::IsMouseHoveringAnyWindow())
+  {
+    if (actions == GLFW_PRESS)
+    {
+      if (button == GLFW_MOUSE_BUTTON_LEFT)
+      {
+        this->leftClickActive = true;
+
+        if (this->interactionMode == INTERACTION_MODE::JOINTS)
+        {
+          this->pick();
+        }
+      }
+      else if (button == GLFW_MOUSE_BUTTON_RIGHT)
+      {
+        this->rightClickActive = true;
+        if (this->interactionMode == INTERACTION_MODE::JOINTS && this->pickedJoints.size() > 0)
+        {
+          this->recordJointCommand();
+        }
+      }
+      else if (button == GLFW_MOUSE_BUTTON_MIDDLE)
+      {
+        this->middleClickActive = true;
+        if (this->interactionMode == INTERACTION_MODE::JOINTS && this->pickedJoints.size() > 0)
+        {
+          this->recordJointCommand();
+        }
+      }
+
+      //this->lastMouseX = this->curMouseX;
+      //this->lastMouseY = this->curMouseY;
+      eventHandled = true;
+    }
+    else if (actions == GLFW_RELEASE)
+    {
+      if (button == GLFW_MOUSE_BUTTON_LEFT)
+      {
+        this->leftClickActive = false;
+      }
+      else if (button == GLFW_MOUSE_BUTTON_RIGHT)
+      {
+        this->rightClickActive = false;
+        if (this->interactionMode == INTERACTION_MODE::JOINTS)
+        {
+          this->saveJointCommand();
+        }
+      }
+      else if (button == GLFW_MOUSE_BUTTON_MIDDLE)
+      {
+        this->middleClickActive = false;
+        if (this->interactionMode == INTERACTION_MODE::JOINTS)
+        {
+          this->saveJointCommand();
+        }
+      }
+      eventHandled = true;
+    }
+  }
+
+  // Fill in with event handling code...
+
+  return eventHandled;
+}
+
+void A5::recordJointCommand()
+{
+  this->curJointMoveCommand.reset();
+  for (unsigned int jointId : this->pickedJoints)
+  {
+    JointNode *joint = this->nodeToJoint[jointId];
+    this->curJointMoveCommand.nodes.emplace_back(joint);
+    this->curJointMoveCommand.oldX.emplace_back(joint->getCurXRot());
+    this->curJointMoveCommand.oldY.emplace_back(joint->getCurYRot());
+  }
+}
+
+void A5::saveJointCommand()
+{
+  for (int i = 0; i < this->curJointMoveCommand.nodes.size(); i++)
+  {
+    JointNode *joint = this->curJointMoveCommand.nodes[i];
+    this->curJointMoveCommand.newX.emplace_back(joint->getCurXRot());
+    this->curJointMoveCommand.newY.emplace_back(joint->getCurYRot());
+  }
+  this->undoStack.emplace(this->curJointMoveCommand);
+  this->redoStack = std::stack<JointMoveCommand>();
+  this->curJointMoveCommand.reset();
+}
+
+//----------------------------------------------------------------------------------------
+/*
+ * Event handler.  Handles mouse scroll wheel events.
+ */
+bool A5::mouseScrollEvent(
+    double xOffSet,
+    double yOffSet)
+{
+  bool eventHandled(false);
+
+  // Fill in with event handling code...
+
+  return eventHandled;
+}
+
+//----------------------------------------------------------------------------------------
+/*
+ * Event handler.  Handles window resize events.
+ */
+bool A5::windowResizeEvent(
+    int width,
+    int height)
+{
+  bool eventHandled(false);
+  initPerspectiveMatrix();
+  return eventHandled;
+}
+
+//----------------------------------------------------------------------------------------
+/*
+ * Event handler.  Handles key input events.
+ */
+bool A5::keyInputEvent(
+    int key,
+    int action,
+    int mods)
+{
+  bool eventHandled(false);
+
+  if (action == GLFW_PRESS)
+  {
+    if (key == GLFW_KEY_M)
+    {
+      show_gui = !show_gui;
+      eventHandled = true;
+    }
+  }
+
+  if (action == GLFW_PRESS)
+  {
+    if (key == GLFW_KEY_W)
+    {
+      this->upPressed = true;
+    }
+    else if (key == GLFW_KEY_S)
+    {
+      this->downPressed = true;
+    }
+    else if (key == GLFW_KEY_A)
+    {
+      this->leftPressed = true;
+    }
+    else if (key == GLFW_KEY_D)
+    {
+      this->rightPressed = true;
+    }
+
+    if (key == GLFW_KEY_O)
+    {
+      this->testFlag = !this->testFlag;
+    }
+  }
+  else if (action == GLFW_RELEASE)
+  {
+    if (key == GLFW_KEY_W)
+    {
+      this->upPressed = false;
+    }
+    else if (key == GLFW_KEY_S)
+    {
+      this->downPressed = false;
+    }
+    else if (key == GLFW_KEY_A)
+    {
+      this->leftPressed = false;
+    }
+    else if (key == GLFW_KEY_D)
+    {
+      this->rightPressed = false;
+    }
+  }
+
+  return eventHandled;
+}
+
+// Calculates rotation vector based on mouse motion over virtual trackball
+// Source: trackball demo given on piazza by Michael Hardy
+glm::vec3 A5::vCalcRotVec(float fNewX, float fNewY,
+                          float fOldX, float fOldY,
+                          float fDiameter)
+{
+  long nXOrigin, nYOrigin;
+  float fNewVecX, fNewVecY, fNewVecZ, /* Vector corresponding to new mouse location */
+      fOldVecX, fOldVecY, fOldVecZ,   /* Vector corresponding to old mouse location */
+      fLength;
+
+  /* Vector pointing from center of virtual trackball to
+    * new mouse position
+    */
+  fNewVecX = fNewX * 2.0 / fDiameter;
+  fNewVecY = fNewY * 2.0 / fDiameter;
+  fNewVecZ = (1.0 - fNewVecX * fNewVecX - fNewVecY * fNewVecY);
+
+  /* If the Z component is less than 0, the mouse point
+    * falls outside of the trackball which is interpreted
+    * as rotation about the Z axis.
+    */
+  if (fNewVecZ < 0.0)
+  {
+    fLength = sqrt(1.0 - fNewVecZ);
+    fNewVecZ = 0.0;
+    fNewVecX /= fLength;
+    fNewVecY /= fLength;
+  }
+  else
+  {
+    fNewVecZ = sqrt(fNewVecZ);
+  }
+  /* Vector pointing from center of virtual trackball to
+    * old mouse position
+    */
+  fOldVecX = fOldX * 2.0 / fDiameter;
+  fOldVecY = fOldY * 2.0 / fDiameter;
+  fOldVecZ = (1.0 - fOldVecX * fOldVecX - fOldVecY * fOldVecY);
+
+  /* If the Z component is less than 0, the mouse point
+    * falls outside of the trackball which is interpreted
+    * as rotation about the Z axis.
+    */
+  if (fOldVecZ < 0.0)
+  {
+    fLength = sqrt(1.0 - fOldVecZ);
+    fOldVecZ = 0.0;
+    fOldVecX /= fLength;
+    fOldVecY /= fLength;
+  }
+  else
+  {
+    fOldVecZ = sqrt(fOldVecZ);
+  }
+
+  /* Generate rotation vector by calculating cross product:
+    * 
+    * fOldVec x fNewVec.
+    * 
+    * The rotation vector is the axis of rotation
+    * and is non-unit length since the length of a crossproduct
+    * is related to the angle between fOldVec and fNewVec which we need
+    * in order to perform the rotation.
+    */
+  float fVecX = fOldVecY * fNewVecZ - fNewVecY * fOldVecZ;
+  float fVecY = fOldVecZ * fNewVecX - fNewVecZ * fOldVecX;
+  float fVecZ = fOldVecX * fNewVecY - fNewVecX * fOldVecY;
+
+  return glm::vec3(fVecX, fVecY, fVecZ);
+}
+
+void A5::mapJoints(SceneNode &root)
+{
+  if (root.m_nodeType == NodeType::JointNode)
+  {
+    JointNode *joint = static_cast<JointNode *>(&root);
+    this->nodeToJoint[root.m_nodeId] = joint;
+    this->joints.emplace(joint);
+    for (const SceneNode *node : root.children)
+    {
+      if (node->m_nodeType == NodeType::GeometryNode)
+      {
+        this->nodeToJoint[node->m_nodeId] = joint;
+      }
+    }
+  }
+
+  for (SceneNode *node : root.children)
+  {
+    this->mapJoints(*node);
+  }
+}
+
+void A5::pick()
+{
+  // Source: PickingExample.cpp given from coude.
+  // Ugly -- FB coordinates might be different than Window coordinates
+  // (e.g., on a retina display).  Must compensate.
+  float xpos = this->curMouseX;
+  float ypos = this->curMouseY;
+  xpos *= double(m_framebufferWidth) / double(m_windowWidth);
+  // WTF, don't know why I have to measure y relative to the bottom of
+  // the window in this case.
+  ypos = m_windowHeight - ypos;
+  ypos *= double(m_framebufferHeight) / double(m_windowHeight);
+
+  this->isPicking = true;
+
+  cout << "PICK" << endl;
+  glClearColor(1.0, 1.0, 1.0, 1.0);
+  glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+  glClearColor(0.85, 0.85, 0.85, 1.0);
+  draw();
+
+  CHECK_GL_ERRORS;
+
+  GLubyte buffer[4] = {0, 0, 0, 0};
+  // A bit ugly -- don't want to swap the just-drawn false colours
+  // to the screen, so read from the back buffer.
+  glReadBuffer(GL_BACK);
+  // Actually read the pixel at the mouse location.
+  glReadPixels(int(xpos), int(ypos), 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, buffer);
+  CHECK_GL_ERRORS;
+
+  // Reassemble the object ID.
+  unsigned int what = buffer[0] + (buffer[1] << 8) + (buffer[2] << 16);
+
+  if (this->nodeToJoint.find(what) != this->nodeToJoint.end())
+  {
+    const JointNode *joint = this->nodeToJoint[what];
+
+    if (this->pickedJoints.find(joint->m_nodeId) == this->pickedJoints.end())
+    {
+      for (const SceneNode *node : joint->children)
+      {
+        if (node->m_nodeType == NodeType::GeometryNode)
+        {
+          this->pickedJointChildren.emplace(node->m_nodeId);
+        }
+      }
+      this->pickedJoints.emplace(joint->m_nodeId);
+    }
+    else
+    {
+      for (const SceneNode *node : joint->children)
+      {
+        if (node->m_nodeType == NodeType::GeometryNode)
+        {
+          this->pickedJointChildren.erase(node->m_nodeId);
+        }
+      }
+      this->pickedJoints.erase(joint->m_nodeId);
+    }
+  }
+
+  this->isPicking = false;
+}
+
+std::string A5::getAssetPath(const char *base)
+{
+  return getAssetFilePath(base);
+}
+
+void A5::InitPass(SceneNode &root)
+{
+
+  root.getAnimMetaData();
+  for (Frame *frame : root.frames)
+  {
+    this->frames.emplace_back(frame);
+  }
+
+  if (root.m_name == "light")
+  {
+    this->m_light.position = glm::vec3(root.trans[3][0], root.trans[3][1], root.trans[3][2]);
+  }
+
+  if (root.particleSystem != nullptr)
+  {
+    root.particleSystem->Init(this->shaders["particleSystem"], &this->viewTransformations, &this->m_perpsective);
+  }
+
+  switch (root.m_nodeType)
+  {
+  case NodeType::GeometryNode:
+  {
+    break;
+  }
+  case NodeType::JointNode:
+    break;
+  }
+
+  for (SceneNode *node : root.children)
+  {
+    this->InitPass(*node);
+  }
+}
+
+void A5::PostInitPass()
+{
+  this->sortAnimFrames();
+  this->prevTime = std::chrono::steady_clock::now();
+}
+
+void A5::sortAnimFrames()
+{
+  std::sort(this->frames.begin(), this->frames.end(), [](Frame *a, Frame *b) {
+    return a->startTime < b->startTime;
+  });
+}
+
+void A5::AnimLogic()
+{
+  deltaTime = 0;
+  auto elapsed = std::chrono::steady_clock::now() - this->prevTime;
+  deltaTime = elapsed.count() / 1000000000.0f;
+  this->absTime += deltaTime;
+  vector<Frame *> deleteFrames;
+
+  for (Frame *frame : this->frames)
+  {
+    SceneNode *node = frame->node;
+
+    if (this->absTime >= frame->startTime && this->absTime <= frame->endTime)
+    {
+
+      float t = (this->absTime - frame->startTime) / (frame->endTime - frame->startTime);
+      t = glm::clamp(t, 0.0f, 1.0f);
+
+      switch (frame->fType)
+      {
+      case FrameType::TRANSLATE:
+        node->animPos = glm::lerp(frame->transformDataFrom, frame->transformDataTo, t);
+        if (node->m_name == "light")
+        {
+          this->m_light.position = node->animPos;
+        }
+        break;
+      case FrameType::SCALE:
+        node->animScale = glm::lerp(frame->transformDataFrom, frame->transformDataTo, t);
+        break;
+      case FrameType::ROTATE_X:
+        node->animRot.x = glm::lerp(frame->magDataFrom, frame->magDataTo, t);
+        break;
+      case FrameType::ROTATE_Y:
+        node->animRot.y = glm::lerp(frame->magDataFrom, frame->magDataTo, t);
+        break;
+      case FrameType::ROTATE_Z:
+        node->animRot.z = glm::lerp(frame->magDataFrom, frame->magDataTo, t);
+        break;
+      }
+
+      node->isAnimating = true;
+    }
+    else if (this->absTime > frame->endTime)
+    {
+      deleteFrames.emplace_back(frame);
+    }
+  }
+
+  for (Frame *frame : deleteFrames)
+  {
+    auto globalFramesRef = std::find(this->frames.begin(), this->frames.end(), frame);
+    frame->node->disabledFrames.emplace_back(frame);
+    this->frames.erase(globalFramesRef);
+
+    if (frame->node->disabledFrames.size() == frame->node->frames.size())
+    {
+      if (frame->node->loopAnim)
+      {
+        frame->node->disabledFrames.clear();
+        float deltaOffset = frame->node->animDuration;
+        for (Frame *animFrame : frame->node->frames)
+        {
+          animFrame->startTime += deltaOffset;
+          animFrame->endTime += deltaOffset;
+          this->frames.emplace_back(animFrame);
+        }
+        this->sortAnimFrames();
+      }
+    }
+    else if (frame->node->disabledFrames.size() > frame->node->frames.size())
+    {
+      cout << "ERROR FRAMES" << endl;
+    }
+  }
+
+  this->prevTime = std::chrono::steady_clock::now();
+}
