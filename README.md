@@ -7,6 +7,7 @@ Then input:
 `./scripts/cs488-maker A5 Assets/room.lua`
 
 See cs488-vid.mkv for a showcase of the animation (at a low framerate)
+
 Youtube demonstration: https://youtu.be/UMacFRnyePw
 
 Excerpt from the CS488 course page:
